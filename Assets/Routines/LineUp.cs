@@ -58,6 +58,14 @@ public class LineUp : SwarmRoutine
         yield return Settle(ctx, targets);
     }
 
+    // End of a routine that has brought the robots (nearly) onto line spots: settle onto them
+    // exactly, then face the participant, as at the end of Play
+    public static IEnumerator Finish(RoutineContext ctx, Vector2Int[] targets)
+    {
+        yield return Settle(ctx, targets);
+        yield return Swarm.TurnTo(ctx, Swarm.FacingParticipant, timeoutMs: 4000, rotateTimeMs: TurnMs);
+    }
+
     static IEnumerator Settle(RoutineContext ctx, Vector2Int[] targets)
     {
         float end = Time.time + SettleMs / 1000f;
