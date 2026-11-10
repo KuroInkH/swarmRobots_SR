@@ -141,10 +141,84 @@ function service_getCharacteristics(serviceID, callback)
     });
 }
 
+// Writes go through a queue per robot: Chrome rejects a write while the previous one to the same
+// robot is still in progress ("GATT operation already in progress"), and before this queue such
+// commands were silently lost. On slower Bluetooth links (often Windows) the toio SDK sends motor
+// commands faster than they can go out, so only the newest pending command per characteristic
+// is kept: a robot never acts on a stale command and the backlog never grows.
+// Every 10 s the console shows how the link is coping ("[BLE] ...").
+var bleWriteQueues = {};
+var bleWriteStats = { sent: 0, replaced: 0, failed: 0, timeouts: 0, totalMs: 0, maxMs: 0, lastError: "" };
+var BLE_WRITE_TIMEOUT_MS = 1000;
+
 function characteristic_writeValue(characteristicID, bytes)
 {
-    characteristicTable[characteristicID].writeValue(bytes);
+    let chara = characteristicTable[characteristicID];
+    if (!chara) return;
+    let key = chara.service.device.id;
+    let q = bleWriteQueues[key];
+    if (!q) { q = bleWriteQueues[key] = { busy: false, order: [], pending: {} }; }
+    if (characteristicID in q.pending) { bleWriteStats.replaced++; }
+    else { q.order.push(characteristicID); }
+    // Copy: bytes is a view into Unity's memory, which is reused after this call returns
+    q.pending[characteristicID] = bytes.slice();
+    ble_pumpWrites(q);
 }
+
+function ble_pumpWrites(q)
+{
+    if (q.busy || q.order.length === 0) return;
+    let id = q.order.shift();
+    let bytes = q.pending[id];
+    delete q.pending[id];
+    let chara = characteristicTable[id];
+    if (!chara) { ble_pumpWrites(q); return; }
+
+    q.busy = true;
+    let finished = false;
+    let started = performance.now();
+    let finish = () => {
+        if (finished) return;
+        finished = true;
+        q.busy = false;
+        ble_pumpWrites(q);
+    };
+    // Never let one stuck write block this robot forever
+    setTimeout(() => { if (!finished) { bleWriteStats.timeouts++; finish(); } }, BLE_WRITE_TIMEOUT_MS);
+
+    let write;
+    try {
+        // Motors (toio's motor characteristic allows it) go without response, as the SDK intends
+        if (chara.properties && chara.properties.writeWithoutResponse && chara.writeValueWithoutResponse) {
+            write = chara.writeValueWithoutResponse(bytes);
+        } else if (chara.writeValueWithResponse) {
+            write = chara.writeValueWithResponse(bytes);
+        } else {
+            write = chara.writeValue(bytes);
+        }
+    } catch (e) {
+        write = Promise.reject(e);
+    }
+    write.then(() => {
+        let ms = performance.now() - started;
+        bleWriteStats.sent++;
+        bleWriteStats.totalMs += ms;
+        if (ms > bleWriteStats.maxMs) bleWriteStats.maxMs = ms;
+    }).catch(e => {
+        bleWriteStats.failed++;
+        bleWriteStats.lastError = (e && e.message) ? e.message : String(e);
+    }).finally(finish);
+}
+
+setInterval(() => {
+    let s = bleWriteStats;
+    if (s.sent + s.failed + s.timeouts + s.replaced === 0) return;
+    let avg = s.sent ? (s.totalMs / s.sent).toFixed(0) : "-";
+    console.log("[BLE] last 10 s: " + s.sent + " commands sent (avg " + avg + " ms, max " + s.maxMs.toFixed(0) + " ms), "
+        + s.replaced + " replaced by a newer one, " + s.failed + " failed, " + s.timeouts + " timed out"
+        + (s.lastError ? ". Last error: " + s.lastError : ""));
+    bleWriteStats = { sent: 0, replaced: 0, failed: 0, timeouts: 0, totalMs: 0, maxMs: 0, lastError: "" };
+}, 10000);
 
 function characteristic_readValue(characteristicID, callback)
 {
