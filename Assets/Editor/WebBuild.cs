@@ -10,13 +10,31 @@ public static class WebBuild
 
     public static void BuildSimulator()
     {
-        var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+        var report = Build();
+        EditorApplication.Exit(report.summary.result == BuildResult.Succeeded ? 0 : 1);
+    }
+
+    // Same build from inside the Unity editor (any OS, e.g. Windows without the tools/ scripts):
+    // menu Swarm > Build web app. Output goes to SimPreview/ in the project folder.
+    [MenuItem("Swarm/Build web app")]
+    public static void BuildFromMenu()
+    {
+        var report = Build();
+        bool ok = report.summary.result == BuildResult.Succeeded;
+        EditorUtility.DisplayDialog("Build web app",
+            ok ? "Done. The web app is in the SimPreview folder of the project."
+               : "The build failed (" + report.summary.totalErrors + " errors). See the Console window.",
+            "OK");
+    }
+
+    static BuildReport Build()
+    {
+        return BuildPipeline.BuildPlayer(new BuildPlayerOptions
         {
             scenes = new[] { CreateSimScene.ScenePath, Scene }, // Simulator first, Control reachable from it
             locationPathName = "SimPreview",
             target = BuildTarget.WebGL,
             options = BuildOptions.None
         });
-        EditorApplication.Exit(report.summary.result == BuildResult.Succeeded ? 0 : 1);
     }
 }

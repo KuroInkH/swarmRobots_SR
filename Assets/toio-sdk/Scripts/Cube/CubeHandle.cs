@@ -83,6 +83,26 @@ namespace toio
         public CubeHandle(Cube _cube)
         {
             this.cube = _cube;
+            // Remember when each position report arrives, so Predict can account for its age
+            this.cube.idCallback.AddListener("CubeHandle.positionTime." + GetHashCode(), c => { lastPositionTime = Time.time; });
+        }
+
+        // --- Position age (dead reckoning) ---
+        // The prediction above assumes the latest position report is fresh. On some Bluetooth links
+        // (seen on Windows laptops) reports arrive in bursts with gaps of 100-400 ms, so the robot
+        // is further along than its last report says. With deadReckoning on, Predict starts from
+        // the time the report arrived and replays the commands sent since, up to maxPositionAge.
+        // With fresh reports (age ~0) the result is the same as before.
+        public static bool deadReckoning = true;
+        public static double maxPositionAge = 0.6;  // s; older reports are treated as this old
+        protected float lastPositionTime = -1;
+        public double positionAge
+        {
+            get
+            {
+                if (!deadReckoning || lastPositionTime < 0) return 0;
+                return Min(Max(Time.time - lastPositionTime, 0), maxPositionAge);
+            }
         }
 
 
@@ -132,45 +152,58 @@ namespace toio
 
             var now = Time.time;
             var t0 = now - lag;
+            // The report is ageSteps prediction steps old: start replaying commands that much
+            // earlier. Step k = ageSteps is "now - lag", where the original prediction started.
+            int ageSteps = (int)Math.Round(positionAge / p_pred_dt);
+            var tStart = t0 - ageSteps * p_pred_dt;
 
             xPred = x; yPred = y; radPred = rad;
+            double curX = x, curY = y, curRad = rad;
             double spdL = 0, spdR = 0;
-            for (var t = t0 - 5 * p_pred_dt; t < now; t += p_pred_dt)
+            int j = 0;
+            var sentTimeHistCount = sentTimeHist.Count;
+            for (int k = -5; ; ++k)
             {
-                // order at t
+                var t = tStart + k * p_pred_dt;
+                if (t >= now) break;
+
+                // order at t: the last order sent at or before t, if it hasn't run out
+                while (j + 1 < sentTimeHistCount && sentTimeHist[j + 1] <= t) ++j;
                 double tarL = 0, tarR = 0;
-                var sentTimeHistCount = sentTimeHist.Count;
-                for (int i = 0; i < sentTimeHistCount; ++i)
+                if (sentTimeHistCount > 0 && sentTimeHist[j] <= t && sentTimeHist[j] + durationHist[j] > t)
                 {
-                    if (sentTimeHist[i] <= t && (i == sentTimeHistCount - 1 || sentTimeHist[i + 1] > t))
-                    {
-                        if (sentTimeHist[i] + durationHist[i] > t)
-                        {
-                            tarL = uLHist[i] * VDotOverU;
-                            tarR = uRHist[i] * VDotOverU;
-                            break;
-                        }
-                    }
+                    tarL = uLHist[j] * VDotOverU;
+                    tarR = uRHist[j] * VDotOverU;
                 }
 
                 // speed at (t+lag), according to order at t.
                 spdL += Sign(tarL - spdL) * Min(Abs(tarL - spdL), p_pred_dt * p_pred_max_acc);
                 spdR += Sign(tarR - spdR) * Min(Abs(tarR - spdR), p_pred_dt * p_pred_max_acc);
 
-                // save speed at now
-                if (Abs(t - t0) < 0.001)
+                // save speed at now; the state replayed so far is where the robot is now
+                if (k == ageSteps)
                 {
                     this.spdL = spdL; this.spdR = spdR;
+                    curX = this.xPred; curY = this.yPred; curRad = this.radPred;
                 }
 
                 // state at (now+lag)
-                if (t >= t0 - 0.001)
+                if (k >= 0)
                 {
                     this.radPred += (float)((spdL - spdR) / TireWidthDot) * p_pred_dt;
                     this.radPred = Rad(this.radPred);
                     this.xPred += Cos(this.radPred) * (spdL + spdR) / 2 * p_pred_dt;
                     this.yPred += Sin(this.radPred) * (spdL + spdR) / 2 * p_pred_dt;
                 }
+            }
+
+            // With an old report, the current state is the replayed one, not the report itself
+            if (ageSteps > 0)
+            {
+                x = curX; y = curY; rad = curRad;
+                deg = Rad2Deg(rad);
+                dir = Vector.fromRadMag(rad, 1);
+                pos = new Vector(x, y);
             }
 
             // speed at (now+lag)
@@ -220,12 +253,15 @@ namespace toio
 
             // Save orders for prediction
             var now = Time.time;
-            int size = (int)(lag / dt + 4);
             uLHist.Add(uL); uRHist.Add(uR); sentTimeHist.Add(now); durationHist.Add(durationMs/1000f);
-            while (uLHist.Count > size) uLHist.RemoveAt(0);
-            while (uRHist.Count > size) uRHist.RemoveAt(0);
-            while (sentTimeHist.Count > size) sentTimeHist.RemoveAt(0);
-            while (durationHist.Count > size) durationHist.RemoveAt(0);
+            // Keep every order that Predict may replay (back to an old position report), plus
+            // the one that was running at the start of that window. Kept by time, not count:
+            // routines send an order every frame, so a fixed count covered less than the lag.
+            var keepFrom = now - (lag + maxPositionAge + 0.1);
+            while (sentTimeHist.Count > 1 && sentTimeHist[1] < keepFrom)
+            {
+                uLHist.RemoveAt(0); uRHist.RemoveAt(0); sentTimeHist.RemoveAt(0); durationHist.RemoveAt(0);
+            }
         }
 
         /// <summary>
